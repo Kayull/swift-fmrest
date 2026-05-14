@@ -57,22 +57,6 @@ let contact = try record.decoded(as: Contact.self)
 - Injectable HTTP transport for unit tests
 - Typed errors for FileMaker API errors, transport failures, invalid JSON, malformed responses, bad gateway responses, and local record misuse
 
-## SwiftPM Installation
-
-```swift
-dependencies: [
-    .package(path: "/Users/kyle/Documents/Work Projects/fmrest-wrapper")
-],
-targets: [
-    .target(
-        name: "YourApp",
-        dependencies: ["swift-fmrest"]
-    )
-]
-```
-
-Import the module with an underscore because Swift identifiers cannot contain hyphens:
-
 ```swift
 import swift_fmrest
 ```
