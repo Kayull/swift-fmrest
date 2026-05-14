@@ -60,11 +60,50 @@ actor MockTransport: FMHTTPTransport {
     #expect(requests[0].method == "POST")
     #expect(requests[0].url.path == "/fmi/data/v1/databases/Demo/sessions")
     #expect(requests[0].headers["Authorization"] == "Basic ZGVtbzpkZW1v")
-    #expect(try bodyObject(requests[0])["fmDataSource"] == .array([]))
+    #expect(try bodyObject(requests[0]).isEmpty)
 
     #expect(requests[1].method == "DELETE")
     #expect(requests[1].url.path == "/fmi/data/v1/databases/Demo/sessions/abc123")
     #expect(requests[1].headers["Authorization"] == nil)
+}
+
+@Test func alternateLoginModesUseOfficialHeadersAndHeaderToken() async throws {
+    let transport = MockTransport(responses: [
+        try envelope(headers: ["X-FM-Data-Access-Token": "oauth-session"]),
+        try envelope(headers: ["X-FM-Data-Access-Token": "claris-session"]),
+    ])
+    let server = try FMServer(
+        url: "https://111.111.111.111",
+        database: "Demo",
+        layout: "Demo",
+        transport: transport
+    )
+
+    let oauthToken = try await server.loginWithOAuth(
+        requestID: "request-id",
+        identifier: "identifier",
+        dataSources: [
+            FMDataSource(
+                database: "Contacts",
+                oAuthRequestId: "external-request-id",
+                oAuthIdentifier: "external-identifier"
+            ),
+        ]
+    )
+    let clarisToken = try await server.loginWithClarisID(token: "claris-id-token")
+
+    #expect(oauthToken == "oauth-session")
+    #expect(clarisToken == "claris-session")
+
+    let requests = await transport.recordedRequests()
+    #expect(requests[0].url.path == "/fmi/data/v1/databases/Demo/sessions")
+    #expect(requests[0].headers["X-FM-Data-OAuth-Request-Id"] == "request-id")
+    #expect(requests[0].headers["X-FM-Data-OAuth-Identifier"] == "identifier")
+    #expect(try bodyObject(requests[0])["fmDataSource"]?.arrayValue?.first?.objectValue?["oAuthRequestId"] == "external-request-id")
+    #expect(try bodyObject(requests[0])["fmDataSource"]?.arrayValue?.first?.objectValue?["oAuthIdentifier"] == "external-identifier")
+
+    #expect(requests[1].headers["Authorization"] == "FMID claris-id-token")
+    #expect(try bodyObject(requests[1]).isEmpty)
 }
 
 @Test func createRecordBuildsPayloadAndUsesBearerToken() async throws {
@@ -82,6 +121,7 @@ actor MockTransport: FMHTTPTransport {
                 .object(["Notes::note": "Hello"]),
             ]),
         ],
+        options: FMWriteOptions(entryMode: .script, prohibitMode: .user),
         scripts: FMScripts(after: FMScriptCall("afterScript", parameter: "param")),
         requestLayout: "People",
         dateFormat: .iso8601
@@ -97,9 +137,11 @@ actor MockTransport: FMHTTPTransport {
     let body = try bodyObject(request)
     #expect(body["fieldData"]?.objectValue?["name"] == "David")
     #expect(body["portalData"]?.objectValue?["notes"]?.arrayValue?.count == 1)
+    #expect(body["options"]?.objectValue?["entrymode"] == "script")
+    #expect(body["options"]?.objectValue?["prohibitmode"] == "user")
     #expect(body["script"] == "afterScript")
     #expect(body["script.param"] == "param")
-    #expect(body["dateformats"] == "2")
+    #expect(body["dateformats"] == 2)
 }
 
 @Test func getRecordParsesFieldsPortalsInfoAndScriptResults() async throws {
@@ -162,6 +204,37 @@ actor MockTransport: FMHTTPTransport {
     #expect(query.contains(URLQueryItem(name: "script.param", value: "input")))
 }
 
+@Test func validateDuplicateAndDynamicLayoutMetadataUseOfficialRoutes() async throws {
+    let transport = MockTransport(responses: [
+        try envelope(response: .object(["token": "session-token"])),
+        try envelope(response: .object(["isSessionInUse": true])),
+        try envelope(response: .object(["recordId": "12", "modId": "0"])),
+        try envelope(response: .object([
+            "valueLists": .array([
+                .object(["name": "Dynamic", "values": .array([])]),
+            ]),
+        ])),
+    ])
+    let server = try makeServer(transport: transport)
+
+    _ = try await server.login()
+    #expect(try await server.validateSession())
+    #expect(try await server.duplicateRecord(id: 2, scripts: FMScripts(after: FMScriptCall("after"))) == 12)
+    _ = try await server.getLayout(metadata: .valueLists, recordID: 2)
+
+    let requests = await transport.recordedRequests()
+    #expect(requests[1].method == "GET")
+    #expect(requests[1].url.path == "/fmi/data/v1/validateSession")
+    #expect(requests[1].headers["Authorization"] == "Bearer session-token")
+
+    #expect(requests[2].method == "POST")
+    #expect(requests[2].url.path == "/fmi/data/v1/databases/Demo/layouts/Demo/records/2")
+    #expect(try bodyObject(requests[2])["script"] == "after")
+
+    #expect(requests[3].url.path == "/fmi/data/v1/databases/Demo/layouts/Demo")
+    #expect(requests[3].url.query == "recordId=2")
+}
+
 @Test func findBuildsBodyWithSortPortalsScriptsAndResponseLayout() async throws {
     let transport = MockTransport(responses: [
         try envelope(response: .object(["token": "session-token"])),
@@ -198,7 +271,23 @@ actor MockTransport: FMHTTPTransport {
     #expect(body["limit.notes"] == 50)
     #expect(body["script.prerequest"] == "before")
     #expect(body["layout.response"] == "Limited")
-    #expect(body["dateformats"] == "1")
+    #expect(body["dateformats"] == 1)
+}
+
+@Test func getRecordsSupportsValueListSortOrders() async throws {
+    let transport = MockTransport(responses: [
+        try envelope(response: .object(["token": "session-token"])),
+        try envelope(response: foundsetResponse()),
+    ])
+    let server = try makeServer(transport: transport)
+
+    _ = try await server.login()
+    _ = try await server.getRecords(sort: [FMSort(fieldName: "status", sortOrder: "Workflow Order")])
+
+    let request = await transport.recordedRequests()[1]
+    let query = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+    let sort = try #require(query.first { $0.name == "_sort" }?.value)
+    #expect(sort.contains("\"sortOrder\":\"Workflow Order\""))
 }
 
 @Test func editDeleteGlobalsAndMetadataRoutesAreBuiltCorrectly() async throws {
@@ -225,7 +314,12 @@ actor MockTransport: FMHTTPTransport {
     let server = try makeServer(transport: transport)
 
     _ = try await server.login()
-    #expect(try await server.editRecord(id: 2, fieldData: ["name": "Updated"], modificationID: 9))
+    #expect(try await server.editRecord(
+        id: 2,
+        fieldData: ["name": "Updated"],
+        modificationID: 9,
+        options: FMWriteOptions(entryMode: .script)
+    ))
     #expect(try await server.deleteRecord(id: 2, scripts: FMScripts(after: FMScriptCall("after"))))
     #expect(try await server.setGlobals(["Table::g": "value"]))
     #expect(try await server.getProductInfo()["name"] == "FileMaker Server")
@@ -241,6 +335,7 @@ actor MockTransport: FMHTTPTransport {
     #expect(requests[1].method == "PATCH")
     #expect(requests[1].url.path == "/fmi/data/v1/databases/Demo/layouts/Demo/records/2")
     #expect(try bodyObject(requests[1])["modId"] == "9")
+    #expect(try bodyObject(requests[1])["options"]?.objectValue?["entrymode"] == "script")
 
     #expect(requests[2].method == "DELETE")
     #expect(requests[2].url.query?.contains("script=after") == true)
@@ -249,11 +344,28 @@ actor MockTransport: FMHTTPTransport {
     #expect(requests[3].url.path == "/fmi/data/v1/databases/Demo/globals")
 
     #expect(requests[4].url.path == "/fmi/data/v1/productInfo")
+    #expect(requests[4].headers["Authorization"] == nil)
+    #expect(requests[4].headers["Content-Type"] == nil)
 
     #expect(requests[5].url.path == "/fmi/data/v1/databases")
     #expect(requests[5].headers["Authorization"] == "Basic ZGVtbzpkZW1v")
 
     #expect(requests[8].url.path == "/fmi/data/v1/databases/Demo/layouts/Demo")
+}
+
+@Test func getDatabasesCanUseNoAuthOrExplicitBasicAuth() async throws {
+    let transport = MockTransport(responses: [
+        try envelope(response: .object(["databases": .array(["Open"])])),
+        try envelope(response: .object(["databases": .array(["Filtered"])])),
+    ])
+    let server = try makeServer(transport: transport)
+
+    #expect(try await server.getDatabases(auth: .none) == ["Open"])
+    #expect(try await server.getDatabases(auth: .basic(username: "user", password: "pass")) == ["Filtered"])
+
+    let requests = await transport.recordedRequests()
+    #expect(requests[0].headers["Authorization"] == nil)
+    #expect(requests[1].headers["Authorization"] == "Basic dXNlcjpwYXNz")
 }
 
 @Test func performScriptReturnsDedicatedScriptResult() async throws {
@@ -376,7 +488,7 @@ actor MockTransport: FMHTTPTransport {
     let server = try makeServer(transport: transport)
 
     _ = try await server.login()
-    #expect(try await server.uploadContainer(recordID: 1, fieldName: "portrait", fileURL: tempFile))
+    #expect(try await server.uploadContainer(recordID: 1, fieldName: "portrait", fileURL: tempFile, modificationID: 7))
     let fetched = try await server.fetchFile(from: fileURL)
 
     #expect(fetched.filename == "file.txt")
@@ -387,6 +499,7 @@ actor MockTransport: FMHTTPTransport {
     let requests = await transport.recordedRequests()
     #expect(requests[1].method == "POST")
     #expect(requests[1].url.path == "/fmi/data/v1/databases/Demo/layouts/Demo/records/1/containers/portrait/1")
+    #expect(requests[1].url.query == "modId=7")
     #expect(requests[1].headers["Content-Type"]?.hasPrefix("multipart/form-data; boundary=") == true)
     #expect(String(data: requests[1].body ?? Data(), encoding: .utf8)?.contains("hello") == true)
 
@@ -412,7 +525,8 @@ private func makeServer(
 private func envelope(
     response: FMValue = .object([:]),
     code: String = "0",
-    message: String = "OK"
+    message: String = "OK",
+    headers: [String: String] = [:]
 ) throws -> FMHTTPResponse {
     let root: FMValue = .object([
         "response": response,
@@ -423,7 +537,7 @@ private func envelope(
             ]),
         ]),
     ])
-    return FMHTTPResponse(statusCode: 200, body: try JSONEncoder().encode(root))
+    return FMHTTPResponse(statusCode: 200, headers: headers, body: try JSONEncoder().encode(root))
 }
 
 private func foundsetResponse() -> FMValue {

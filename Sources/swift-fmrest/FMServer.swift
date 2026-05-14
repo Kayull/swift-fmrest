@@ -51,15 +51,65 @@ public final class FMServer: @unchecked Sendable {
         self.init(configuration: configuration, transport: transport)
     }
 
+    public convenience init(
+        url: String,
+        database: String,
+        layout: String,
+        dataSources: [FMDataSource] = [],
+        apiVersion: FMAPIVersion = .v1,
+        timeout: TimeInterval = 10,
+        autoRelogin: Bool = false,
+        transport: any FMHTTPTransport = URLSessionFMHTTPTransport()
+    ) throws {
+        let configuration = try FMServerConfiguration(
+            url: url,
+            database: database,
+            layout: layout,
+            dataSources: dataSources,
+            apiVersion: apiVersion,
+            timeout: timeout,
+            autoRelogin: autoRelogin
+        )
+        self.init(configuration: configuration, transport: transport)
+    }
+
     @discardableResult
-    public func login() async throws -> String? {
+    public func login(dataSources: [FMDataSource]? = nil) async throws -> String? {
+        let selectedDataSources = dataSources ?? configuration.dataSources
         let response = try await callFileMaker(
             method: "POST",
             path: authPath(token: ""),
-            body: [
-                "fmDataSource": .array(configuration.dataSources.map(\.value)),
-            ],
+            body: loginBody(dataSources: selectedDataSources),
             authMode: .basic
+        )
+        token = response["token"]?.stringValue
+        return token
+    }
+
+    @discardableResult
+    public func loginWithOAuth(
+        requestID: String,
+        identifier: String,
+        dataSources: [FMDataSource]? = nil
+    ) async throws -> String? {
+        let selectedDataSources = dataSources ?? configuration.dataSources
+        let response = try await callFileMaker(
+            method: "POST",
+            path: authPath(token: ""),
+            body: loginBody(dataSources: selectedDataSources),
+            authMode: .oauth(requestID: requestID, identifier: identifier)
+        )
+        token = response["token"]?.stringValue
+        return token
+    }
+
+    @discardableResult
+    public func loginWithClarisID(token clarisIDToken: String) async throws -> String? {
+        let response = try await callFileMaker(
+            method: "POST",
+            path: authPath(token: ""),
+            body: [:],
+            authMode: .clarisID(clarisIDToken)
         )
         token = response["token"]?.stringValue
         return token
@@ -78,6 +128,19 @@ public final class FMServer: @unchecked Sendable {
         return lastError == FMSErrorCode.success.rawValue
     }
 
+    public func validateSession() async throws -> Bool {
+        try await performWithAutoRelogin {
+            let response = try await self.callFileMaker(
+                method: "GET",
+                path: self.validateSessionPath()
+            )
+            guard let isSessionInUse = response["isSessionInUse"]?.boolValue else {
+                throw FMError.malformedResponse("Validate session response did not contain isSessionInUse.")
+            }
+            return isSessionInUse
+        }
+    }
+
     @discardableResult
     public func create(_ record: FMRecord, requestLayout: String? = nil) async throws -> Int? {
         try await createRecord(
@@ -90,6 +153,7 @@ public final class FMServer: @unchecked Sendable {
     public func createRecord(
         fieldData: [String: FMValue],
         portals: [String: FMValue]? = nil,
+        options: FMWriteOptions? = nil,
         scripts: FMScripts? = nil,
         requestLayout: String? = nil,
         dateFormat: FMDateFormat? = nil
@@ -103,8 +167,12 @@ public final class FMServer: @unchecked Sendable {
                 requestData["portalData"] = .object(portals)
             }
 
+            if let options {
+                requestData["options"] = options.value
+            }
+
             if let dateFormat {
-                requestData["dateformats"] = .string(dateFormat.rawValue)
+                requestData["dateformats"] = dateFormat.value
             }
 
             if let scripts {
@@ -140,6 +208,7 @@ public final class FMServer: @unchecked Sendable {
         fieldData: [String: FMValue],
         modificationID: Int? = nil,
         portals: [String: FMValue]? = nil,
+        options: FMWriteOptions? = nil,
         scripts: FMScripts? = nil,
         requestLayout: String? = nil,
         dateFormat: FMDateFormat? = nil
@@ -157,8 +226,12 @@ public final class FMServer: @unchecked Sendable {
                 requestData["portalData"] = .object(portals)
             }
 
+            if let options {
+                requestData["options"] = options.value
+            }
+
             if let dateFormat {
-                requestData["dateformats"] = .string(dateFormat.rawValue)
+                requestData["dateformats"] = dateFormat.value
             }
 
             if let scripts {
@@ -171,6 +244,22 @@ public final class FMServer: @unchecked Sendable {
                 body: requestData
             )
             return self.lastError == FMSErrorCode.success.rawValue
+        }
+    }
+
+    @discardableResult
+    public func duplicateRecord(
+        id recordID: Int,
+        scripts: FMScripts? = nil,
+        requestLayout: String? = nil
+    ) async throws -> Int? {
+        try await performWithAutoRelogin {
+            let response = try await self.callFileMaker(
+                method: "POST",
+                path: self.recordPath(recordID: recordID, layout: requestLayout),
+                body: scripts?.valueParameters ?? [:]
+            )
+            return response["recordId"]?.intValue
         }
     }
 
@@ -290,7 +379,7 @@ public final class FMServer: @unchecked Sendable {
             }
 
             if let dateFormat {
-                body["dateformats"] = .string(dateFormat.rawValue)
+                body["dateformats"] = dateFormat.value
             }
 
             if let scripts {
@@ -334,6 +423,7 @@ public final class FMServer: @unchecked Sendable {
         fieldName: String,
         fileURL: URL,
         repetition: Int = 1,
+        modificationID: Int? = nil,
         requestLayout: String? = nil
     ) async throws -> Bool {
         try await performWithAutoRelogin {
@@ -357,6 +447,7 @@ public final class FMServer: @unchecked Sendable {
                 path: self.recordPath(recordID: recordID, layout: requestLayout)
                     + "/containers/\(self.encodePathSegment(fieldName))/\(repetition)",
                 rawBody: body,
+                query: ["modId": modificationID.map(String.init)],
                 contentType: "multipart/form-data; boundary=\(boundary)"
             )
             return self.lastError == FMSErrorCode.success.rawValue
@@ -403,18 +494,24 @@ public final class FMServer: @unchecked Sendable {
     }
 
     public func getProductInfo() async throws -> [String: FMValue] {
-        let response = try await callFileMaker(method: "GET", path: metaProductPath())
+        let response = try await callFileMaker(
+            method: "GET",
+            path: metaProductPath(),
+            authMode: .none,
+            contentType: nil
+        )
         guard let productInfo = response["productInfo"]?.objectValue else {
             throw FMError.malformedResponse("Product info response did not contain productInfo.")
         }
         return productInfo
     }
 
-    public func getDatabases() async throws -> [FMValue] {
+    public func getDatabases(auth: FMDatabaseListAuthentication = .configuredBasic) async throws -> [FMValue] {
         let response = try await callFileMaker(
             method: "GET",
             path: metaDatabasesPath(),
-            authMode: .basic
+            authMode: authMode(for: auth),
+            contentType: nil
         )
         return response["databases"]?.arrayValue ?? []
     }
@@ -435,13 +532,15 @@ public final class FMServer: @unchecked Sendable {
 
     public func getLayout(
         _ targetLayout: String? = nil,
-        metadata: FMLayoutMetadata = .fields
+        metadata: FMLayoutMetadata = .fields,
+        recordID: Int? = nil
     ) async throws -> FMValue {
         try await performWithAutoRelogin {
             let selectedLayout = targetLayout ?? self.layout
             let response = try await self.callFileMaker(
                 method: "GET",
-                path: self.metaLayoutsPath() + "/\(self.encodePathSegment(selectedLayout))"
+                path: self.metaLayoutsPath() + "/\(self.encodePathSegment(selectedLayout))",
+                query: ["recordId": recordID.map(String.init)]
             )
 
             switch metadata {
@@ -489,6 +588,9 @@ private extension FMServer {
     enum AuthMode {
         case bearerIfPresent
         case basic
+        case basicCredentials(username: String, password: String)
+        case clarisID(String)
+        case oauth(requestID: String, identifier: String)
         case none
     }
 
@@ -572,13 +674,21 @@ private extension FMServer {
             response = [:]
         }
 
-        updateScriptResult(from: response)
+        var responseWithHeaders = response
+        if
+            responseWithHeaders["token"] == nil,
+            let accessToken = headerValue("X-FM-Data-Access-Token", in: httpResponse.headers)
+        {
+            responseWithHeaders["token"] = .string(accessToken)
+        }
+
+        updateScriptResult(from: responseWithHeaders)
 
         guard code == FMSErrorCode.success.rawValue else {
             throw FMError.fileMaker(code: code, message: message.message ?? "Unknown error")
         }
 
-        return response
+        return responseWithHeaders
     }
 
     func makeRequest(
@@ -619,9 +729,14 @@ private extension FMServer {
                 headers["Authorization"] = "Bearer \(token)"
             }
         case .basic:
-            let credentials = "\(configuration.username):\(configuration.password)"
-            let encoded = Data(credentials.utf8).base64EncodedString()
-            headers["Authorization"] = "Basic \(encoded)"
+            headers["Authorization"] = basicAuthorization(username: configuration.username, password: configuration.password)
+        case let .basicCredentials(username, password):
+            headers["Authorization"] = basicAuthorization(username: username, password: password)
+        case let .clarisID(token):
+            headers["Authorization"] = "FMID \(token)"
+        case let .oauth(requestID, identifier):
+            headers["X-FM-Data-OAuth-Request-Id"] = requestID
+            headers["X-FM-Data-OAuth-Identifier"] = identifier
         case .none:
             break
         }
@@ -642,6 +757,28 @@ private extension FMServer {
             body: requestBody,
             timeout: configuration.timeout
         )
+    }
+
+    func loginBody(dataSources: [FMDataSource]) -> [String: FMValue] {
+        guard !dataSources.isEmpty else { return [:] }
+        return ["fmDataSource": .array(dataSources.map(\.value))]
+    }
+
+    func authMode(for databaseListAuthentication: FMDatabaseListAuthentication) -> AuthMode {
+        switch databaseListAuthentication {
+        case .none:
+            return .none
+        case .configuredBasic:
+            return .basic
+        case let .basic(username, password):
+            return .basicCredentials(username: username, password: password)
+        }
+    }
+
+    func basicAuthorization(username: String, password: String) -> String {
+        let credentials = "\(username):\(password)"
+        let encoded = Data(credentials.utf8).base64EncodedString()
+        return "Basic \(encoded)"
     }
 
     func processFoundsetResponse(_ response: [String: FMValue]) throws -> FMFoundset {
@@ -725,7 +862,8 @@ private extension FMServer {
         let portalNames = portals.map(\.name)
         let portalValue: String
         if namesAsString {
-            portalValue = "[" + portalNames.map { "\"\($0)\"" }.joined(separator: ", ") + "]"
+            let data = (try? JSONEncoder().encode(portalNames)) ?? Data("[]".utf8)
+            portalValue = String(data: data, encoding: .utf8) ?? "[]"
         } else {
             portalValue = portalNames.joined(separator: ",")
         }
@@ -787,7 +925,13 @@ private extension FMServer {
     }
 
     func authPath(token: String) -> String {
-        "\(apiPrefix())/databases/\(encodePathSegment(configuration.database))/sessions/\(encodePathSegment(token))"
+        let sessionsPath = "\(apiPrefix())/databases/\(encodePathSegment(configuration.database))/sessions"
+        guard !token.isEmpty else { return sessionsPath }
+        return "\(sessionsPath)/\(encodePathSegment(token))"
+    }
+
+    func validateSessionPath() -> String {
+        "\(apiPrefix())/validateSession"
     }
 
     func recordsPath(layout requestLayout: String?) -> String {
@@ -838,4 +982,3 @@ private extension Data {
         append(Data(string.utf8))
     }
 }
-

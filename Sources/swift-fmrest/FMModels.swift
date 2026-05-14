@@ -53,9 +53,33 @@ public struct FMScripts: Equatable, Sendable {
     }
 }
 
-public enum FMSortOrder: String, Codable, Sendable {
-    case ascend
-    case descend
+public struct FMSortOrder: RawRepresentable, Codable, Equatable, Sendable, ExpressibleByStringLiteral {
+    public var rawValue: String
+
+    public static let ascend = FMSortOrder("ascend")
+    public static let descend = FMSortOrder("descend")
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public init(_ rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    public init(stringLiteral value: String) {
+        self.rawValue = value
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        self.rawValue = try container.decode(String.self)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 public struct FMSort: Codable, Equatable, Sendable {
@@ -73,6 +97,38 @@ public struct FMSort: Codable, Equatable, Sendable {
             "sortOrder": .string(sortOrder.rawValue),
         ])
     }
+}
+
+public enum FMWriteMode: String, Sendable {
+    case user
+    case script
+}
+
+public struct FMWriteOptions: Equatable, Sendable {
+    public var entryMode: FMWriteMode?
+    public var prohibitMode: FMWriteMode?
+
+    public init(entryMode: FMWriteMode? = nil, prohibitMode: FMWriteMode? = nil) {
+        self.entryMode = entryMode
+        self.prohibitMode = prohibitMode
+    }
+
+    internal var value: FMValue {
+        var object: [String: FMValue] = [:]
+        if let entryMode {
+            object["entrymode"] = .string(entryMode.rawValue)
+        }
+        if let prohibitMode {
+            object["prohibitmode"] = .string(prohibitMode.rawValue)
+        }
+        return .object(object)
+    }
+}
+
+public enum FMDatabaseListAuthentication: Equatable, Sendable {
+    case none
+    case configuredBasic
+    case basic(username: String, password: String)
 }
 
 public struct FMPortalRequest: Equatable, Sendable {
@@ -110,4 +166,3 @@ public struct FMFetchedFile: Equatable, Sendable {
         self.data = data
     }
 }
-
