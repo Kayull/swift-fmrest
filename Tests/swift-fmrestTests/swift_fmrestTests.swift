@@ -23,6 +23,65 @@ actor MockTransport: FMHTTPTransport {
     }
 }
 
+actor FlakyTransport: FMHTTPTransport {
+    private var failures: [Error]
+    private let response: FMHTTPResponse
+    private var requests: [FMHTTPRequest] = []
+
+    init(failures: [Error], response: FMHTTPResponse) {
+        self.failures = failures
+        self.response = response
+    }
+
+    func send(_ request: FMHTTPRequest) async throws -> FMHTTPResponse {
+        requests.append(request)
+        if !failures.isEmpty {
+            throw failures.removeFirst()
+        }
+        return response
+    }
+
+    func recordedRequests() -> [FMHTTPRequest] {
+        requests
+    }
+}
+
+@Test func retryingTransportRetriesTransientURLErrors() async throws {
+    let flaky = FlakyTransport(
+        failures: [URLError(.notConnectedToInternet)],
+        response: FMHTTPResponse(statusCode: 200, body: Data("ok".utf8))
+    )
+    let retrying = RetryingFMHTTPTransport(
+        flaky,
+        retryPolicy: FMRetryPolicy(maxAttempts: 2, initialDelay: 0)
+    )
+    let request = FMHTTPRequest(method: "GET", url: URL(string: "https://example.com")!)
+
+    let response = try await retrying.send(request)
+
+    #expect(response.body == Data("ok".utf8))
+    let requests = await flaky.recordedRequests()
+    #expect(requests.count == 2)
+}
+
+@Test func retryingTransportDoesNotRetryNonRetryableErrors() async throws {
+    let flaky = FlakyTransport(
+        failures: [URLError(.userAuthenticationRequired)],
+        response: FMHTTPResponse(statusCode: 200, body: Data("ok".utf8))
+    )
+    let retrying = RetryingFMHTTPTransport(
+        flaky,
+        retryPolicy: FMRetryPolicy(maxAttempts: 3, initialDelay: 0)
+    )
+    let request = FMHTTPRequest(method: "GET", url: URL(string: "https://example.com")!)
+
+    await #expect(throws: URLError.self) {
+        _ = try await retrying.send(request)
+    }
+    let requests = await flaky.recordedRequests()
+    #expect(requests.count == 1)
+}
+
 @Test func configurationRejectsPlainHTTPExceptInternalService() throws {
     #expect(throws: FMError.self) {
         _ = try FMServerConfiguration(
