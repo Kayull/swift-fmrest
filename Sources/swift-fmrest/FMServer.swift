@@ -9,19 +9,47 @@ public enum FMLayoutMetadata: Sendable {
 
 public final class FMServer: @unchecked Sendable {
     public let configuration: FMServerConfiguration
-    public var layout: String
-    public private(set) var lastError: Int?
-    public private(set) var lastScriptResult: [String: FMScriptResult] = [:]
+
+    public var layout: String {
+        get { state.withLock { $0.layout } }
+        set { state.withLock { $0.layout = newValue } }
+    }
+
+    public private(set) var lastError: Int? {
+        get { state.withLock { $0.lastError } }
+        set { state.withLock { $0.lastError = newValue } }
+    }
+
+    public private(set) var lastScriptResult: [String: FMScriptResult] {
+        get { state.withLock { $0.lastScriptResult } }
+        set { state.withLock { $0.lastScriptResult = newValue } }
+    }
 
     private let transport: any FMHTTPTransport
-    private var token: String?
+
+    private var token: String? {
+        get { state.withLock { $0.token } }
+        set { state.withLock { $0.token = newValue } }
+    }
+
+    /// Everything a request changes, behind a lock, so one server can be used from several
+    /// tasks at once. With overlapping requests, `lastError` and `lastScriptResult` are those
+    /// of whichever finished last.
+    private struct State {
+        var layout: String
+        var lastError: Int?
+        var lastScriptResult: [String: FMScriptResult] = [:]
+        var token: String?
+    }
+
+    private let state: Locked<State>
 
     public init(
         configuration: FMServerConfiguration,
         transport: any FMHTTPTransport = URLSessionFMHTTPTransport()
     ) {
         self.configuration = configuration
-        self.layout = configuration.layout
+        self.state = Locked(State(layout: configuration.layout))
         self.transport = transport
     }
 
@@ -980,5 +1008,21 @@ private extension FMServer {
 private extension Data {
     mutating func appendUTF8(_ string: String) {
         append(Data(string.utf8))
+    }
+}
+
+/// A value only read and changed while holding a lock.
+private final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func withLock<T>(_ body: (inout Value) throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body(&value)
     }
 }
